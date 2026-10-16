@@ -267,15 +267,78 @@ class BinanceFuturesClient:
             logger.error(f"Gagal mengambil posisi untuk {symbol}: {e}")
             raise
 
+    def get_all_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        """
+        Mengambil semua open orders untuk simbol terkait,
+        mencakup standard orders dan conditional/algo orders (STOP_MARKET, TAKE_PROFIT_MARKET).
+        """
+        all_orders = []
+        # 1. Ambil order reguler
+        try:
+            reg_orders = self.client.futures_get_open_orders(symbol=symbol)
+            if isinstance(reg_orders, list):
+                for o in reg_orders:
+                    o["is_algo"] = False
+                    all_orders.append(o)
+        except Exception as e:
+            logger.debug(f"Gagal mengambil regular open orders untuk {symbol}: {e}")
+
+        # 2. Ambil algo/conditional orders (STOP_MARKET, TAKE_PROFIT, dll)
+        try:
+            algo_res = self.client.futures_get_open_algo_orders(symbol=symbol)
+            algo_list = []
+            if isinstance(algo_res, dict) and "algoOrders" in algo_res:
+                algo_list = algo_res["algoOrders"]
+            elif isinstance(algo_res, list):
+                algo_list = algo_res
+
+            for a in algo_list:
+                a["is_algo"] = True
+                if "orderId" not in a and "algoId" in a:
+                    a["orderId"] = a["algoId"]
+                if "type" not in a and "algoType" in a:
+                    a["type"] = a["algoType"]
+                all_orders.append(a)
+        except Exception as e:
+            logger.debug(f"Gagal mengambil algo open orders untuk {symbol}: {e}")
+
+        return all_orders
+
+    def cancel_order_by_id(self, symbol: str, order: Dict[str, Any]) -> bool:
+        """Membatalkan order baik bertipe reguler maupun algo/conditional order."""
+        try:
+            if order.get("is_algo") or "algoId" in order or "algoType" in order:
+                algo_id = order.get("algoId") or order.get("orderId")
+                self.client.futures_cancel_algo_order(symbol=symbol, algoId=algo_id)
+                logger.info(f"Algo order {symbol} (algoId: {algo_id}, Type: {order.get('type') or order.get('algoType')}) berhasil dibatalkan.")
+            else:
+                order_id = order.get("orderId")
+                self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
+                logger.info(f"Regular order {symbol} (orderId: {order_id}, Type: {order.get('type')}) berhasil dibatalkan.")
+            return True
+        except Exception as e:
+            logger.warning(f"Gagal membatalkan order {order.get('orderId') or order.get('algoId')} untuk {symbol}: {e}")
+            return False
+
     def cancel_all_orders(self, symbol: str):
-        """Membatalkan seluruh open conditional orders (misal sisa SL/TP)."""
+        """Membatalkan seluruh open orders (baik regular orders maupun algo/conditional orders SL/TP)."""
+        # 1. Batalkan semua regular orders
         try:
             self.client.futures_cancel_all_open_orders(symbol=symbol)
-            logger.info(f"Semua open orders untuk {symbol} telah dibatalkan.")
         except BinanceAPIException as e:
-            logger.warning(f"Gagal membatalkan open orders ({e.code}): {e.message}")
+            logger.debug(f"Info cancel regular orders ({e.code}): {e.message}")
         except Exception as e:
-            logger.error(f"Error koneksi saat cancel orders: {e}")
+            logger.debug(f"Error cancel regular orders: {e}")
+
+        # 2. Batalkan semua algo orders (SL, TP, Trailing Stop)
+        try:
+            self.client.futures_cancel_all_algo_open_orders(symbol=symbol)
+        except BinanceAPIException as e:
+            logger.debug(f"Info cancel algo orders ({e.code}): {e.message}")
+        except Exception as e:
+            logger.debug(f"Error cancel algo orders: {e}")
+
+        logger.info(f"Semua open orders (regular & algo SL/TP) untuk {symbol} telah dibatalkan.")
 
     def execute_market_order(self, symbol: str, side: str, quantity: float) -> Dict[str, Any]:
         """
@@ -315,7 +378,8 @@ class BinanceFuturesClient:
                 stopPrice=stop_price,
                 closePosition=True,
             )
-            logger.info(f"Stop Loss order terpasang! ID: {order.get('orderId')}")
+            order_id = order.get("orderId") or order.get("algoId")
+            logger.info(f"Stop Loss order terpasang! ID: {order_id}")
             return order
         except BinanceAPIException as e:
             if e.code == -4130 and retry_on_conflict:
@@ -324,19 +388,26 @@ class BinanceFuturesClient:
                     f"Membersihkan order lama di arah {order_side} dan memasang ulang Stop Loss..."
                 )
                 try:
-                    open_orders = self.client.futures_get_open_orders(symbol=symbol)
+                    open_orders = self.get_all_open_orders(symbol=symbol)
+                    canceled_any = False
                     for o in open_orders:
-                        o_type = o.get("type", "")
+                        o_type = o.get("type", "") or o.get("algoType", "")
                         o_side = o.get("side", "")
                         if o_side == order_side and (
                             o.get("closePosition") is True 
                             or o_type in ("STOP_MARKET", "STOP", "STOP_LOSS", "TRAILING_STOP_MARKET")
                         ):
-                            try:
-                                self.client.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
-                                logger.info(f"Order konflik lama {symbol} (ID: {o['orderId']}, Type: {o_type}) dibatalkan.")
-                            except Exception:
-                                pass
+                            if self.cancel_order_by_id(symbol, o):
+                                canceled_any = True
+
+                    # Fallback jika tidak terdeteksi via list, bersihkan algo orders di symbol ini
+                    if not canceled_any:
+                        try:
+                            self.client.futures_cancel_all_algo_open_orders(symbol=symbol)
+                            logger.info(f"Fallback cancel all algo open orders dijalankan untuk {symbol}.")
+                        except Exception:
+                            pass
+
                     time.sleep(0.5)  # Beri jeda ke Binance matching engine agar order lama benar-benar bersih
                     # Pasang ulang SL
                     retry_order = self.client.futures_create_order(
@@ -346,7 +417,8 @@ class BinanceFuturesClient:
                         stopPrice=stop_price,
                         closePosition=True,
                     )
-                    logger.info(f"[AUTO-RECOVERY] Stop Loss {symbol} BERHASIL dipasang setelah pembersihan order konflik! ID: {retry_order.get('orderId')}")
+                    order_id = retry_order.get("orderId") or retry_order.get("algoId")
+                    logger.info(f"[AUTO-RECOVERY] Stop Loss {symbol} BERHASIL dipasang setelah pembersihan order konflik! ID: {order_id}")
                     return retry_order
                 except Exception as retry_err:
                     logger.error(f"[AUTO-RECOVERY GAGAL] Tidak dapat memasang Stop Loss {symbol}: {retry_err}")
@@ -374,7 +446,8 @@ class BinanceFuturesClient:
                 stopPrice=tp_price,
                 closePosition=True,
             )
-            logger.info(f"Take Profit order terpasang! ID: {order.get('orderId')}")
+            order_id = order.get("orderId") or order.get("algoId")
+            logger.info(f"Take Profit order terpasang! ID: {order_id}")
             return order
         except BinanceAPIException as e:
             if e.code == -4130 and retry_on_conflict:
@@ -383,19 +456,16 @@ class BinanceFuturesClient:
                     f"Membersihkan order lama di arah {order_side} dan memasang ulang Take Profit..."
                 )
                 try:
-                    open_orders = self.client.futures_get_open_orders(symbol=symbol)
+                    open_orders = self.get_all_open_orders(symbol=symbol)
                     for o in open_orders:
-                        o_type = o.get("type", "")
+                        o_type = o.get("type", "") or o.get("algoType", "")
                         o_side = o.get("side", "")
                         if o_side == order_side and (
                             o.get("closePosition") is True 
                             or o_type in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT")
                         ):
-                            try:
-                                self.client.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
-                                logger.info(f"Order TP konflik lama {symbol} (ID: {o['orderId']}, Type: {o_type}) dibatalkan.")
-                            except Exception:
-                                pass
+                            self.cancel_order_by_id(symbol, o)
+
                     time.sleep(0.5)
                     retry_order = self.client.futures_create_order(
                         symbol=symbol,
@@ -404,7 +474,8 @@ class BinanceFuturesClient:
                         stopPrice=tp_price,
                         closePosition=True,
                     )
-                    logger.info(f"[AUTO-RECOVERY] Take Profit {symbol} BERHASIL dipasang kembali! ID: {retry_order.get('orderId')}")
+                    order_id = retry_order.get("orderId") or retry_order.get("algoId")
+                    logger.info(f"[AUTO-RECOVERY] Take Profit {symbol} BERHASIL dipasang kembali! ID: {order_id}")
                     return retry_order
                 except Exception as retry_err:
                     logger.error(f"[AUTO-RECOVERY GAGAL] Tidak dapat memasang Take Profit {symbol}: {retry_err}")
@@ -419,27 +490,23 @@ class BinanceFuturesClient:
     def move_stop_loss(self, symbol: str, position_side: str, new_stop_price: float, label: str = "Break-Even") -> bool:
         """
         Memindahkan Stop Loss yang ada ke harga baru (Break-Even atau Trailing Stop).
-        Membatalkan STOP_MARKET lama secara bersih dan memasang STOP_MARKET baru di harga new_stop_price.
+        Membatalkan STOP_MARKET lama secara bersih (termasuk openAlgoOrders) dan memasang STOP_MARKET baru.
         """
         order_side = "SELL" if position_side.upper() == "LONG" else "BUY"
         try:
-            open_orders = self.client.futures_get_open_orders(symbol=symbol)
+            open_orders = self.get_all_open_orders(symbol=symbol)
             canceled_count = 0
             for o in open_orders:
-                o_type = o.get("type", "")
+                o_type = o.get("type", "") or o.get("algoType", "")
                 o_side = o.get("side", "")
                 if o_side == order_side and (
                     o.get("closePosition") is True or o_type in ("STOP_MARKET", "STOP", "STOP_LOSS", "TRAILING_STOP_MARKET")
                 ):
-                    try:
-                        self.client.futures_cancel_order(symbol=symbol, orderId=o["orderId"])
-                        logger.info(f"Order SL lama untuk {symbol} (ID: {o['orderId']}) dibatalkan untuk geser ke {label}.")
+                    if self.cancel_order_by_id(symbol, o):
                         canceled_count += 1
-                    except Exception as ce:
-                        logger.warning(f"Gagal cancel order {o.get('orderId')}: {ce}")
 
             if canceled_count > 0:
-                time.sleep(0.4)  # Beri jeda ke Binance matching engine agar order lama benar-benar bersih
+                time.sleep(0.5)  # Beri jeda ke Binance matching engine agar order lama benar-benar bersih
 
             # Pasang SL baru di harga new_stop_price
             res = self.place_stop_loss_order(symbol, position_side, new_stop_price)
