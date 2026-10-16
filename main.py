@@ -173,6 +173,7 @@ def main():
     breakeven_locked = set()
     trailing_tier_locked = {}
     last_season_block = ""
+    last_heartbeat_time = time.time()
 
     try:
         while True:
@@ -324,6 +325,17 @@ def main():
                     if last_season_block:
                         logger.info(f"{Fore.GREEN}[INTRADAY SEASONALITY] Jendela entry kembali aktif: {season_reason}{Style.RESET_ALL}")
                         last_season_block = ""
+
+                # Heartbeat Pulse periodik (tiap 60 detik) jika tidak ada posisi aktif
+                if not current_positions and (time.time() - last_heartbeat_time >= 60):
+                    sess_info = seasonality.get_current_session()
+                    logger.info(
+                        f"{Fore.CYAN}[HEARTBEAT {sess_info['wib_time']}]{Style.RESET_ALL} "
+                        f"Bot berjalan normal memindai {len(config.symbols)} koin | "
+                        f"{sess_info['session_label']} | "
+                        f"Slot: 0/{config.max_active_positions} aktif | Status: Menunggu setup momentum..."
+                    )
+                    last_heartbeat_time = time.time()
 
                 for sym in config.symbols:
                     if sym in current_positions:
