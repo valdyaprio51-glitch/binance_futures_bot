@@ -1,0 +1,30 @@
+# Kredensial Rahasia & API Keys (SANGAT PENTING: JANGAN DI-COMMIT)
+.env
+*.env
+.env.local
+
+# Virtual Environment
+venv/
+.venv/
+env/
+ENV/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Log Files
+*.log
+
+# Temporary test scripts
+audit_overnight.py
+check_idr.py
+check_wallets.py
+
+# Editor & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
