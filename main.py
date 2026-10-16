@@ -395,6 +395,7 @@ def main():
 
                             # 1. Batalkan sisa order lama jika ada
                             client.cancel_all_orders(sym)
+                            time.sleep(0.5)
 
                             # 2. Eksekusi Market Order Buka Posisi
                             client.execute_market_order(
@@ -403,13 +404,22 @@ def main():
                                 quantity=qty,
                             )
 
-                            # Jeda 1 detik agar posisi terdaftar
+                            # Jeda 1 detik agar posisi terdaftar di sistem Binance
                             time.sleep(1)
 
                             # 3. Pasang Stop Loss & Take Profit Awal
                             pos_side = "LONG" if sig == "BUY" else "SHORT"
-                            client.place_stop_loss_order(sym, pos_side, sl_price)
-                            client.place_take_profit_order(sym, pos_side, tp_price)
+                            sl_res = client.place_stop_loss_order(sym, pos_side, sl_price)
+                            time.sleep(0.5)
+                            tp_res = client.place_take_profit_order(sym, pos_side, tp_price)
+
+                            if sl_res:
+                                logger.info(f"{Fore.GREEN}Proteksi Stop Loss {sym} AKTIF di ${sl_price}!{Style.RESET_ALL}")
+                            else:
+                                logger.error(f"{Fore.RED}{Style.BRIGHT}[PERINGATAN KRUSIAL] Stop Loss {sym} BELUM TERPASANG di bursa! Harap periksa manual!{Style.RESET_ALL}")
+
+                            if tp_res:
+                                logger.info(f"{Fore.GREEN}Target Take Profit {sym} AKTIF di ${tp_price}!{Style.RESET_ALL}")
 
                             logger.info(f"{Fore.GREEN}Posisi {sym} {pos_side} dan proteksi SL/TP aktif!{Style.RESET_ALL}\n")
 
